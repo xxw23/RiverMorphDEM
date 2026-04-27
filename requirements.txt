@@ -1,1 +1,8 @@
-
+streamlit
+numpy
+scipy
+rasterio
+matplotlib
+trimesh
+pillow
+plotly
