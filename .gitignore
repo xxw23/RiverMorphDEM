@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+venv/
+env/
+.streamlit/secrets.toml
+outputs/
+temp/
+*.pyc
+*.log
+*.zip
+*.obj
+*.tif
+*.tiff
