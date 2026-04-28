@@ -3,7 +3,7 @@
 RiverMorph-DEM: 基于 DEM 的类 flowing-terrain 河流地貌生成网页工具
 
 运行方式：
-streamlit run river_morphology_app.py
+python -m streamlit run app.py
 
 功能：
 1. 上传 DEM GeoTIFF；
@@ -25,7 +25,6 @@ import os
 import zipfile
 import tempfile
 import heapq
-from pathlib import Path
 
 import numpy as np
 import streamlit as st
@@ -35,7 +34,7 @@ from rasterio.transform import Affine
 from scipy import ndimage
 import matplotlib.pyplot as plt
 import trimesh
-from PIL import Image
+import plotly.graph_objects as go
 
 
 # =========================================================
@@ -47,6 +46,41 @@ st.set_page_config(
     page_icon="🌊",
     layout="wide"
 )
+
+
+PRESET_CONFIGS = {
+    "Custom / 自定义": {},
+    "UAV / local gully DEM": {
+        "max_size": 1200,
+        "stream_percentile": 99.5,
+        "min_stream_size": 30,
+        "incision_depth": 3.0,
+        "valley_width": 8.0,
+        "smooth_sigma": 0.3,
+        "z_exaggeration": 1.5,
+        "max_mesh_size": 500
+    },
+    "Small catchment DEM": {
+        "max_size": 1000,
+        "stream_percentile": 99.3,
+        "min_stream_size": 20,
+        "incision_depth": 10.0,
+        "valley_width": 50.0,
+        "smooth_sigma": 0.5,
+        "z_exaggeration": 1.5,
+        "max_mesh_size": 450
+    },
+    "Large basin demo": {
+        "max_size": 800,
+        "stream_percentile": 99.0,
+        "min_stream_size": 10,
+        "incision_depth": 20.0,
+        "valley_width": 150.0,
+        "smooth_sigma": 0.6,
+        "z_exaggeration": 1.5,
+        "max_mesh_size": 350
+    }
+}
 
 
 # =========================================================
@@ -85,12 +119,88 @@ def fill_nodata_nearest(dem, nodata=None):
     return arr
 
 
+def diagnose_dem(uploaded_file, nodata_ratio_warn=0.10):
+    """
+    读取 DEM 基本质量信息并给出提示，不改变 DEM 算法处理流程。
+    """
+    if hasattr(uploaded_file, "getvalue"):
+        file_bytes = uploaded_file.getvalue()
+    else:
+        file_bytes = uploaded_file.read()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with rasterio.open(tmp_path) as src:
+            dem_raw = src.read(1).astype(np.float64)
+            rows, cols = src.height, src.width
+            nodata = src.nodata
+            crs = src.crs
+            transform = src.transform
+
+        invalid = ~np.isfinite(dem_raw)
+        if nodata is not None and np.isfinite(nodata):
+            invalid |= (dem_raw == nodata)
+
+        total_pixels = dem_raw.size
+        nodata_pixels = int(invalid.sum())
+        nodata_ratio = float(nodata_pixels / total_pixels) if total_pixels > 0 else 1.0
+
+        valid = dem_raw[~invalid]
+        if valid.size == 0:
+            raise ValueError("DEM 中没有有效高程像元，无法进行诊断。")
+
+        elev_min = float(np.min(valid))
+        elev_max = float(np.max(valid))
+        elev_range = elev_max - elev_min
+
+        p01 = float(np.percentile(valid, 1))
+        p99 = float(np.percentile(valid, 99))
+        robust_range = p99 - p01
+
+        elevation_notes = []
+        if elev_range < 1.0:
+            elevation_notes.append("高程范围过小（max-min < 1），请确认数据单位或数值是否异常。")
+        if robust_range > 0 and elev_range > 10.0 * robust_range:
+            elevation_notes.append("检测到极端高程离群值，建议检查异常噪声或 NoData 编码。")
+
+        cell_x = abs(transform.a)
+        cell_y = abs(transform.e)
+        crs_text = str(crs) if crs else "None"
+        is_projected = bool(crs and crs.is_projected)
+
+        return {
+            "rows": rows,
+            "cols": cols,
+            "elev_min": elev_min,
+            "elev_max": elev_max,
+            "nodata": nodata,
+            "nodata_ratio": nodata_ratio,
+            "nodata_ratio_warn": nodata_ratio > nodata_ratio_warn,
+            "pixel_size_x": float(cell_x),
+            "pixel_size_y": float(cell_y),
+            "crs_text": crs_text,
+            "is_projected": is_projected,
+            "large_invalid_area": nodata_ratio > nodata_ratio_warn,
+            "elevation_notes": elevation_notes
+        }
+    finally:
+        os.remove(tmp_path)
+
+
 def read_uploaded_dem(uploaded_file, max_size=800):
     """
     从 Streamlit 上传文件读取 DEM。
     """
+    if hasattr(uploaded_file, "getvalue"):
+        file_bytes = uploaded_file.getvalue()
+    else:
+        file_bytes = uploaded_file.read()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
-        tmp.write(uploaded_file.read())
+        tmp.write(file_bytes)
         tmp_path = tmp.name
 
     with rasterio.open(tmp_path) as src:
@@ -327,6 +437,50 @@ def overlay_to_png_bytes(dem, acc, streams, title=None):
     return buf
 
 
+def build_3d_preview_figure(carved_dem, transform, z_exaggeration=1.0, max_preview_size=260):
+    """
+    构建网页内三维预览（降采样），仅用于快速交互查看。
+    """
+    nrows, ncols = carved_dem.shape
+    scale = max(nrows, ncols) / float(max_preview_size)
+    step = max(1, int(np.ceil(scale)))
+
+    dem_ds = carved_dem[::step, ::step]
+    rows_ds, cols_ds = dem_ds.shape
+
+    rr = np.arange(rows_ds) * step
+    cc = np.arange(cols_ds) * step
+    cc_grid, rr_grid = np.meshgrid(cc, rr)
+    xs, ys = rasterio.transform.xy(transform, rr_grid, cc_grid, offset="center")
+    x = np.asarray(xs)
+    y = np.asarray(ys)
+    z = dem_ds * float(z_exaggeration)
+
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=x,
+                y=y,
+                z=z,
+                colorscale="Earth",
+                colorbar=dict(title="Elevation")
+            )
+        ]
+    )
+    fig.update_layout(
+        title=f"3D Preview (downsample step={step}, shape={rows_ds}×{cols_ds})",
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title=f"Elevation × {z_exaggeration:.2f}",
+            aspectmode="data"
+        ),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=600
+    )
+    return fig, step, rows_ds, cols_ds
+
+
 def save_geotiff_to_path(path, array, profile):
     profile_out = profile.copy()
     profile_out.update(dtype="float32", count=1, compress="lzw")
@@ -469,8 +623,40 @@ st.markdown(
 """
 )
 
+st.markdown(
+    """
+**参数预设说明：**
+- **UAV / local gully DEM**：适用于无人机、小范围冲沟、局地沟道。
+- **Small catchment DEM**：适用于小流域或坡面-沟道系统。
+- **Large basin demo**：适用于较大流域的课堂演示或区域 DEM。
+"""
+)
+
 with st.sidebar:
     st.header("参数设置")
+
+    st.session_state.setdefault("max_size", 800)
+    st.session_state.setdefault("stream_percentile", 99.3)
+    st.session_state.setdefault("min_stream_size", 8)
+    st.session_state.setdefault("incision_depth", 20.0)
+    st.session_state.setdefault("valley_width", 150.0)
+    st.session_state.setdefault("smooth_sigma", 0.6)
+    st.session_state.setdefault("z_exaggeration", 1.5)
+    st.session_state.setdefault("max_mesh_size", 350)
+    st.session_state.setdefault("parameter_preset", "Custom / 自定义")
+    st.session_state.setdefault("applied_preset", "Custom / 自定义")
+
+    parameter_preset = st.selectbox(
+        "Parameter preset / 参数预设",
+        options=list(PRESET_CONFIGS.keys()),
+        key="parameter_preset"
+    )
+
+    if parameter_preset != st.session_state.get("applied_preset"):
+        if parameter_preset != "Custom / 自定义":
+            for param_name, param_value in PRESET_CONFIGS[parameter_preset].items():
+                st.session_state[param_name] = param_value
+        st.session_state["applied_preset"] = parameter_preset
 
     uploaded_dem = st.file_uploader(
         "上传 DEM GeoTIFF 文件",
@@ -481,8 +667,8 @@ with st.sidebar:
         "参与计算的最大 DEM 尺寸",
         min_value=300,
         max_value=1500,
-        value=800,
         step=100,
+        key="max_size",
         help="数值越大结果越精细，但计算越慢。"
     )
 
@@ -490,8 +676,8 @@ with st.sidebar:
         "河网提取阈值百分位",
         min_value=95.0,
         max_value=99.9,
-        value=99.3,
         step=0.1,
+        key="stream_percentile",
         help="数值越高，河网越稀疏；数值越低，支流越多。"
     )
 
@@ -499,25 +685,25 @@ with st.sidebar:
         "最小河网斑块大小",
         min_value=1,
         max_value=100,
-        value=8,
-        step=1
+        step=1,
+        key="min_stream_size"
     )
 
     incision_depth = st.slider(
         "最大河谷下切深度",
         min_value=1.0,
         max_value=100.0,
-        value=20.0,
         step=1.0,
+        key="incision_depth",
         help="单位与 DEM 高程单位一致，通常为米。"
     )
 
     valley_width = st.slider(
         "河谷宽度控制参数",
-        min_value=10.0,
+        min_value=1.0,
         max_value=1000.0,
-        value=150.0,
-        step=10.0,
+        step=1.0,
+        key="valley_width",
         help="单位与 DEM 水平单位一致，投影坐标下通常为米。"
     )
 
@@ -525,24 +711,24 @@ with st.sidebar:
         "地形平滑强度",
         min_value=0.0,
         max_value=5.0,
-        value=0.6,
-        step=0.1
+        step=0.1,
+        key="smooth_sigma"
     )
 
     z_exaggeration = st.slider(
         "三维模型高程夸张系数",
         min_value=0.2,
         max_value=5.0,
-        value=1.5,
-        step=0.1
+        step=0.1,
+        key="z_exaggeration"
     )
 
     max_mesh_size = st.slider(
         "OBJ 模型最大网格尺寸",
         min_value=100,
         max_value=800,
-        value=350,
         step=50,
+        key="max_mesh_size",
         help="越大模型越精细，但 OBJ 文件越大。"
     )
 
@@ -552,6 +738,44 @@ with st.sidebar:
 if uploaded_dem is None:
     st.info("请在左侧上传一个 DEM GeoTIFF 文件，然后点击“开始生成”。")
     st.stop()
+
+try:
+    dem_diag = diagnose_dem(uploaded_dem)
+except Exception as diag_err:
+    st.error(f"DEM 诊断失败：{diag_err}")
+    st.stop()
+
+st.subheader("DEM 数据质量检查")
+q1, q2, q3, q4 = st.columns(4)
+q1.metric("DEM 行数", dem_diag["rows"])
+q2.metric("DEM 列数", dem_diag["cols"])
+q3.metric("高程最小值", f'{dem_diag["elev_min"]:.3f}')
+q4.metric("高程最大值", f'{dem_diag["elev_max"]:.3f}')
+
+q5, q6, q7, q8 = st.columns(4)
+q5.metric("NoData 值", str(dem_diag["nodata"]))
+q6.metric("NoData 像元比例", f'{dem_diag["nodata_ratio"] * 100:.2f}%')
+q7.metric("像元分辨率 X", f'{dem_diag["pixel_size_x"]:.6f}')
+q8.metric("像元分辨率 Y", f'{dem_diag["pixel_size_y"]:.6f}')
+
+st.markdown(
+    f"- **CRS**: `{dem_diag['crs_text']}`\n"
+    f"- **是否为投影坐标系**: {'是' if dem_diag['is_projected'] else '否'}\n"
+    f"- **是否可能存在大量无效区域**: {'是' if dem_diag['large_invalid_area'] else '否'}"
+)
+
+if not dem_diag["is_projected"]:
+    st.warning(
+        "当前 DEM 可能为经纬度坐标系，河谷宽度参数不能直接理解为米，建议先投影到米制坐标系后再处理。"
+    )
+
+if dem_diag["nodata_ratio_warn"]:
+    st.warning(
+        "检测到 DEM 存在较多 NoData 区域，建议先裁剪有效地形范围，避免边界插值造成三角形伪地形。"
+    )
+
+for note in dem_diag["elevation_notes"]:
+    st.info(f"高程范围提示：{note}")
 
 
 if run_button:
@@ -583,7 +807,7 @@ if run_button:
         progress.progress(60)
 
         status.write("正在雕刻河谷...")
-        carved, incision, distance_m = carve_valleys(
+        carved, incision, _distance_m = carve_valleys(
             dem=filled,
             streams=streams,
             transform=transform,
@@ -685,6 +909,19 @@ if run_button:
                 caption="雕刻后地形 + 汇流潜势 + 河网",
                 use_container_width=True
             )
+
+        st.subheader("3D Preview / 三维预览")
+        preview_fig, preview_step, preview_rows, preview_cols = build_3d_preview_figure(
+            carved_dem=carved,
+            transform=transform,
+            z_exaggeration=z_exaggeration,
+            max_preview_size=260
+        )
+        st.plotly_chart(preview_fig, use_container_width=True)
+        st.caption(
+            "三维预览为降采样显示，仅用于快速查看地形形态；完整模型请下载 OBJ 文件。"
+            f"（当前预览降采样步长={preview_step}，预览尺寸={preview_rows}×{preview_cols}）"
+        )
 
         st.subheader("结果下载")
 
